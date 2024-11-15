@@ -1,13 +1,31 @@
+# Load necessary libraries
 library(shiny)
 library(leaflet)
+library(leaflet.extras)
 library(ggplot2)
 library(dplyr)
 library(readxl)
+library(reshape2)
+library(xgboost)
 
+# Load data
 data <- read_excel("/Users/nirvanipathak/Downloads/newdata_cleaned.xlsx")
-median_price <- median(data$price, na.rm = TRUE)
-
 heatmap_data <- read_excel("/Users/nirvanipathak/Downloads/lotwize@npathak (2)/lotwize_case.xlsx")
+
+# Ensure latitude and longitude are numeric
+heatmap_data <- heatmap_data %>%
+  mutate(
+    latitude = as.numeric(latitude),
+    longitude = as.numeric(longitude)
+  ) %>%
+  filter(!is.na(latitude) & !is.na(longitude))
+
+# Train XGBoost Model (or load a pre-trained model)
+set.seed(123)
+train_data <- data %>% select(-price)  # Exclude price column for training features
+train_labels <- data$price
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = train_labels)
+xgb_model <- xgboost(data = dtrain, max_depth = 6, nrounds = 100, objective = "reg:squarederror")
 
 # Define UI
 ui <- fluidPage(
@@ -30,32 +48,23 @@ ui <- fluidPage(
   
   hr(style = "border-top: 2px solid #ddd; margin-top: 20px;"),
   
-  fluidRow(
-    column(6, textInput("latitude", "Enter Latitude", placeholder = "e.g., 37.7749")),
-    column(6, textInput("longitude", "Enter Longitude", placeholder = "e.g., -122.4194"))
-  ),
-  actionButton("add_marker", "Add Marker", style = "width: 100%; padding: 10px; margin-top: 10px; background-color: #28a745; color: white; border: none; border-radius: 5px;"),
-  hr(style = "border-top: 1px solid #ddd; margin-top: 20px;"),
-  
   uiOutput("content_area")
 )
 
 # Define Server
 server <- function(input, output, session) {
   active_tab <- reactiveVal("market_overview")
-  user_marker <- reactiveVal(NULL)
   
   observeEvent(input$market_overview, { active_tab("market_overview") })
   observeEvent(input$correlation_analysis, { active_tab("correlation_analysis") })
   
-  observeEvent(input$add_marker, {
-    lat <- as.numeric(input$latitude)
-    lon <- as.numeric(input$longitude)
-    if (!is.na(lat) && !is.na(lon)) {
-      user_marker(c(lat, lon))
-    } else {
-      user_marker(NULL)
-    }
+  # Reactive prediction for Average Price using XGBoost model
+  predicted_price <- reactive({
+    req(active_tab() == "market_overview")
+    new_data <- data %>% select(-price)  # Create features for prediction
+    dnew <- xgb.DMatrix(data = as.matrix(new_data))
+    pred <- predict(xgb_model, dnew)
+    mean(pred, na.rm = TRUE)  # Get average predicted price
   })
   
   output$content_area <- renderUI({
@@ -63,8 +72,8 @@ server <- function(input, output, session) {
       div(
         fluidRow(
           column(4, wellPanel(
-            h4("Average Price", class = "panel-title"),
-            h3(paste0("$", formatC(median_price, format = "f", big.mark = ",", digits = 2)), class = "highlight-text")
+            h4("Predicted Average Price", class = "panel-title"),
+            h3(paste0("$", formatC(predicted_price(), format = "f", big.mark = ",", digits = 2)), class = "highlight-text")
           )),
           column(4, wellPanel(
             h4("Most Expensive Neighborhood in CA", class = "panel-title"),
@@ -94,11 +103,9 @@ server <- function(input, output, session) {
     selected_columns <- c('price', 'mortgageZHLRates/thirtyYearFixedBucket/rate', 
                           'priceHistory/0/priceChangeRate', 'lotAreaValue', 'tourViewCount', 
                           'bedrooms', 'zipcode_cluster')
-    
     data_filtered <- data %>% select(all_of(selected_columns))
     corr <- cor(data_filtered, use = "complete.obs")
-    
-    ggplot2::ggplot(melt(corr), aes(Var1, Var2, fill = value)) +
+    ggplot(melt(corr), aes(Var1, Var2, fill = value)) +
       geom_tile(color = "white") +
       scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1, 1), space = "Lab") +
       theme_minimal() +
@@ -110,19 +117,11 @@ server <- function(input, output, session) {
     m <- leaflet() %>%
       addTiles() %>%
       setView(lng = -122.4194, lat = 37.7749, zoom = 6)
-    
-    # Prepare data for HeatMap
-    heat_data <- heatmap_data %>%
-      filter(!is.na(latitude) & !is.na(longitude)) %>%
-      select(latitude, longitude)
-    
-    m %>% addHeatmap(lng = heat_data$longitude, lat = heat_data$latitude, radius = 10)
-    
-    # Add the user-specified marker if available
-    if (!is.null(user_marker())) {
-      m <- m %>% addMarkers(lng = user_marker()[2], lat = user_marker()[1], popup = "User Input Location")
-    }
-    
+    m <- m %>% addHeatmap(
+      lng = heatmap_data$longitude,
+      lat = heatmap_data$latitude,
+      radius = 10
+    )
     m
   })
 }
